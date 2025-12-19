@@ -408,22 +408,36 @@ int8_t ism330dhcxReadRaw(Ism330dhcxHandle_t *handle, Ism330dhcxRawData_t *data)
     
     /* 0x22 adresinden 12 byte oku (gyro + accel) */
     uint8_t accel_ready, gyro_ready;
+
+    stmdev_ctx_t *ctx = &handle->dev_ctx;
     // ism330dhcxDataReady(handle, &accel_ready, &gyro_ready);
     // if (accel_ready == 0 || gyro_ready == 0)
     // {
     //     return -1;
     // }
+
+    while(accel_ready == 0)
+    {
+        ism330dhcx_xl_flag_data_ready_get(ctx, &accel_ready);
+    }
+    ism330dhcx_acceleration_raw_get(ctx, data->accel);
+
+    while(gyro_ready == 0)
+    {
+        ism330dhcx_gy_flag_data_ready_get(ctx, &gyro_ready);
+    }
+    ism330dhcx_angular_rate_raw_get(ctx, data->gyro);
     
-    platform_read(handle, 0x22, raw_buf, 12);
+    //platform_read(handle, 0x22, raw_buf, 12);
     
     /* Parse: Little endian (LSB first) */
-    data->gyro[0] = (int16_t)(raw_buf[1] << 8 | raw_buf[0]);   /* OUTX_G */
-    data->gyro[1] = (int16_t)(raw_buf[3] << 8 | raw_buf[2]);   /* OUTY_G */
-    data->gyro[2] = (int16_t)(raw_buf[5] << 8 | raw_buf[4]);   /* OUTZ_G */
+    // data->gyro[0] = (int16_t)(raw_buf[1] << 8 | raw_buf[0]);   /* OUTX_G */
+    // data->gyro[1] = (int16_t)(raw_buf[3] << 8 | raw_buf[2]);   /* OUTY_G */
+    // data->gyro[2] = (int16_t)(raw_buf[5] << 8 | raw_buf[4]);   /* OUTZ_G */
     
-    data->accel[0] = (int16_t)(raw_buf[7] << 8 | raw_buf[6]);  /* OUTX_XL */
-    data->accel[1] = (int16_t)(raw_buf[9] << 8 | raw_buf[8]);  /* OUTY_XL */
-    data->accel[2] = (int16_t)(raw_buf[11] << 8 | raw_buf[10]);/* OUTZ_XL */
+    // data->accel[0] = (int16_t)(raw_buf[7] << 8 | raw_buf[6]);  /* OUTX_XL */
+    // data->accel[1] = (int16_t)(raw_buf[9] << 8 | raw_buf[8]);  /* OUTY_XL */
+    // data->accel[2] = (int16_t)(raw_buf[11] << 8 | raw_buf[10]);/* OUTZ_XL */
     
     /* Temperature ayrı okunabilir, kritik değil */
     //ism330dhcx_temperature_raw_get(&handle->dev_ctx, &data->temp);

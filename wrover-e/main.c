@@ -27,6 +27,9 @@
 #include "ton.h"
 #include "edge_detection.h"
 
+#include "ble_tuner.h"
+#include "helper.h"
+
 static const char *TAG = "MAIN";
 
 
@@ -47,10 +50,10 @@ static const char *TAG = "MAIN";
 #define PWM_MAX_DUTY            1023
 
 /* Motor GPIO Pins */
-#define MOTOR1_GPIO             2       /* Front-Right (M1) */
-#define MOTOR2_GPIO             4       /* Rear-Right (M2) */
-#define MOTOR3_GPIO             5       /* Rear-Left (M3) */
-#define MOTOR4_GPIO             19       /* Front-Left (M4) */
+#define MOTOR1_GPIO             19      /* Front-Right (M1) */
+#define MOTOR2_GPIO             5       /* Rear-Right (M2) */
+#define MOTOR3_GPIO             4       /* Rear-Left (M3) */
+#define MOTOR4_GPIO             2       /* Front-Left (M4) */
 
 /*******************************************************************************
  * Global Variables - Control Modules
@@ -107,6 +110,14 @@ static edge_detection_t g_ed_rate = {0};
 static edge_detection_t g_ed_ui = {0};
 
 
+/* BLE Tuner timing */
+#define PERIOD_BLE_TELEMETRY_MS     100     /* 10 Hz */
+static ton_t g_ton_ble_telemetry = {0};
+static edge_detection_t g_ed_ble_telemetry = {0};
+
+
+
+
 /*******************************************************************************
  * Global Variables - Hardware
  ******************************************************************************/
@@ -130,6 +141,20 @@ Ism330dhcxPins_t pins =
 /*******************************************************************************
  * PWM Motor Functions
  ******************************************************************************/
+void cmdArm(void);
+void cmdDisarm(void);
+void cmdSetThrottle(float throttle);
+void cmdSetRoll(float deg);
+void cmdSetPitch(float deg);
+void cmdSetYawRate(float dps);
+void cmdResetYaw(void);
+void cmdSetAttitudeGains(float kp, float ki, float kd);
+void cmdSetRateGains(float kp, float ki, float kd);
+
+static void onBleCommand(const bleTunerCommand_t *cmd);
+static void onBleDisconnect(void);
+static void onBleGetGains(bleTunerGains_t *gains);
+
 
 static int8_t pwmMotorsInit(void)
 {
@@ -171,7 +196,6 @@ static int8_t pwmMotorsInit(void)
 }
 
 
-
 static void pwmMotorsSet(const MotorOutput_t *motors)
 {
     for (int i = 0; i < 4; i++) {
@@ -210,6 +234,7 @@ static void taskImuRead(void)
 {
     Ism330dhcxData_t data;
     int8_t ret = ism330dhcxRead(&imu, &data);
+    //todo: compansate eklenecek(helper.h)
 
     /* Store accel (m/s²) */
     g_accel[0] = data.accel_g[0];
@@ -327,8 +352,14 @@ static void taskUiTelemetry(void)
              g_gyro[1], g_gyro[2]);
 }
 
+#include "esp_system.h"
+#include "esp_chip_info.h"
 static int8_t systemInit(void)
 {
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+
+    printf("ESP32 revision: %d\n", chip_info.revision);
 
     int8_t ret = ism330dhcxInitPins(&imu, &pins);
     if (ret != ISM330DHCX_OK) {
@@ -413,8 +444,23 @@ void app_main(void)
         return;
     }
 
+        // BLE Tuner Init
+    if (bleTunerInit("QUAD-FC") != 0) {
+        ESP_LOGE(TAG, "BLE Tuner init failed");
+        return;
+    }
+    
+    // Register callbacks
+    bleTunerSetCmdCallback(onBleCommand);
+    bleTunerSetDisconnectCallback(onBleDisconnect);
+    bleTunerSetGetGainsCallback(onBleGetGains);
+    
+    ESP_LOGI(TAG, "BLE Tuner ready, advertising as: QUAD-FC");
+
     vTaskDelay(pdMS_TO_TICKS(500));
     ESP_LOGI(TAG, "Starting main loop... (DISARMED)");
+    //cmdSetThrottle(4);
+    //cmdArm();
 
     /*=========================================================================
      * Main Loop - TON timer based scheduling
@@ -471,28 +517,60 @@ void app_main(void)
         pulse_ui = edgeDetection(&g_ed_ui, g_ton_ui.aux == 0);
         
         if (pulse_ui) {
-            taskUiTelemetry();
+           // taskUiTelemetry();
+        }
+
+        //=====================================================================
+        // BLE Heartbeat Check 
+        //=====================================================================
+        if (bleTunerCheckHeartbeatTimeout(systick)) {
+            ESP_LOGW(TAG, "BLE Heartbeat timeout - Auto DISARM!");
+            cmdDisarm();
+            bleTunerResetHeartbeat(systick);  // Tekrar timeout olmaması için reset
+        }
+        
+        //=====================================================================
+        // BLE Telemetry - 10 Hz (every 100ms)
+        //=====================================================================
+        if (TON(&g_ton_ble_telemetry, 1, systick, PERIOD_BLE_TELEMETRY_MS)) {
+            TON(&g_ton_ble_telemetry, 0, 0, 0);
+        }
+        uint8_t pulse_ble_tel = edgeDetection(&g_ed_ble_telemetry, g_ton_ble_telemetry.aux == 0);
+        
+        if (pulse_ble_tel && bleTunerIsConnected() && bleTunerIsTelemetryEnabled())
+        {
+            // Telemetri verisi hazırla
+            bleTunerTelemetry_t tel = {0};
+            
+            // Quaternion'dan Euler açıları
+            GimbalStatus_t gimbal_status;
+            EulerAngles_t euler;
+            Quaternion_t q;
+
+            quatToEulerZYX(&g_quaternion, &euler, &gimbal_status);
+            
+            tel.roll_deg = CTRL_RAD_TO_DEG(euler.roll);
+            tel.pitch_deg = CTRL_RAD_TO_DEG(euler.pitch);
+            tel.yaw_deg = CTRL_RAD_TO_DEG(g_yaw_integrated_rad);
+            
+            // Motor çıkışları
+            tel.motor[0] = g_motors.motor[0];
+            tel.motor[1] = g_motors.motor[1];
+            tel.motor[2] = g_motors.motor[2];
+            tel.motor[3] = g_motors.motor[3];
+            
+            // Gyro (rad/s -> deg/s)
+            tel.gyro_x_dps = CTRL_RAD_TO_DEG(g_gyro[0]);
+            tel.gyro_y_dps = CTRL_RAD_TO_DEG(g_gyro[1]);
+            tel.gyro_z_dps = CTRL_RAD_TO_DEG(g_gyro[2]);
+            
+            bleTunerSendTelemetry(&tel);
         }
 
         /* Small delay to prevent CPU hogging */
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-
-    // while (1) 
-    // {
-    //     ret = ism330dhcxRead(&imu, &data);
-        
-    //     if (ret == ISM330DHCX_OK) {
-    //         ESP_LOGI(TAG, "Accel[g]: %.3f, %.3f, %.3f | Gyro[dps]: %.1f, %.1f, %.1f",
-    //                     data.accel_g[0], data.accel_g[1], data.accel_g[2],
-    //                     data.gyro_dps[0], data.gyro_dps[1], data.gyro_dps[2]);
-    //     }
-        
-    //     vTaskDelay(pdMS_TO_TICKS(10));  /* ~100 Hz for demo */
-
-    //     vTaskDelayUntil(&last_wake_time, period_ticks);
-    // }
 }
 
 
@@ -592,3 +670,162 @@ void cmdSetRateGains(float kp, float ki, float kd)
     rateSetRollPitchGains(&g_rate, kp, ki, kd);
     ESP_LOGI(TAG, "Rate gains: P=%.2f I=%.2f D=%.4f", kp, ki, kd);
 }
+
+
+
+
+
+
+/*******************************************************************************
+ * 3. BLE CALLBACK FONKSİYONLARI s
+ ******************************************************************************/
+
+
+/**
+ * @brief BLE komut callback'i
+ * @note BLE context'inden çağrılır, hızlı olmalı!
+ */
+static void onBleCommand(const bleTunerCommand_t *cmd)
+{
+    switch (cmd->cmd) {
+        case BLE_CMD_ARM:
+            cmdArm();
+            break;
+            
+        case BLE_CMD_DISARM:
+            cmdDisarm();
+            break;
+            
+        case BLE_CMD_THROTTLE:
+            cmdSetThrottle(cmd->data.value);
+            break;
+            
+        case BLE_CMD_ROLL:
+            cmdSetRoll(cmd->data.value);
+            break;
+            
+        case BLE_CMD_PITCH:
+            cmdSetPitch(cmd->data.value);
+            break;
+            
+        case BLE_CMD_YAW:
+            cmdSetYawRate(cmd->data.value);
+            break;
+            
+        case BLE_CMD_RATE_RP:
+            cmdSetRateGains(cmd->data.gains.kp, 
+                           cmd->data.gains.ki, 
+                           cmd->data.gains.kd);
+            break;
+            
+        case BLE_CMD_RATE_YAW:
+            rateSetYawGains(&g_rate, 
+                           cmd->data.gains.kp, 
+                           cmd->data.gains.ki, 
+                           cmd->data.gains.kd);
+            ESP_LOGI(TAG, "Rate Yaw gains: P=%.2f I=%.2f D=%.4f", 
+                     cmd->data.gains.kp, cmd->data.gains.ki, cmd->data.gains.kd);
+            break;
+            
+        case BLE_CMD_ATT_RP:
+            cmdSetAttitudeGains(cmd->data.gains.kp, 
+                               cmd->data.gains.ki, 
+                               cmd->data.gains.kd);
+            break;
+            
+        case BLE_CMD_HEARTBEAT:
+            bleTunerResetHeartbeat(getSysTickMs());
+            break;
+            
+        case BLE_CMD_TEL_ENABLE:
+            ESP_LOGI(TAG, "Telemetry %s", cmd->data.enable ? "enabled" : "disabled");
+            break;
+            
+        case BLE_CMD_GET:
+            /* GET komutu ble_tuner.c içinde handle ediliyor */
+            break;
+            
+        default:
+            break;
+    }
+}
+
+/**
+ * @brief BLE disconnect callback (auto-disarm)
+ */
+static void onBleDisconnect(void)
+{
+    ESP_LOGW(TAG, "BLE Disconnected - Auto DISARM!");
+    cmdDisarm();
+}
+
+/**
+ * @brief BLE get gains callback
+ */
+static void onBleGetGains(bleTunerGains_t *gains)
+{
+    if (gains == NULL) return;
+    
+    /* Rate Roll/Pitch gains */
+    gains->rate_rp.kp = g_rate.config.roll_pitch_gains.kp;
+    gains->rate_rp.ki = g_rate.config.roll_pitch_gains.ki;
+    gains->rate_rp.kd = g_rate.config.roll_pitch_gains.kd;
+    
+    /* Rate Yaw gains */
+    gains->rate_yaw.kp = g_rate.config.yaw_gains.kp;
+    gains->rate_yaw.ki = g_rate.config.yaw_gains.ki;
+    gains->rate_yaw.kd = g_rate.config.yaw_gains.kd;
+    
+    /* Attitude Roll/Pitch gains */
+    gains->att_rp.kp = g_attitude.config.roll_pitch_gains.kp;
+    gains->att_rp.ki = g_attitude.config.roll_pitch_gains.ki;
+    gains->att_rp.kd = g_attitude.config.roll_pitch_gains.kd;
+}
+
+
+
+
+
+
+/*******************************************************************************
+ * 6. NRF CONNECT KULLANIM KILAVUZU
+ ******************************************************************************/
+
+/*
+nRF Connect for Mobile ile Kullanım:
+
+1. Uygulamayı aç
+2. "QUAD-FC" cihazını tara ve bağlan
+3. "Nordic UART Service" altındaki servisi aç
+4. TX characteristic'te "Enable CCCDs" (notify) butonuna bas
+5. RX characteristic'e komut yaz:
+
+Örnek Komutlar:
+---------------
+ARM                     -> Motorları aktif et
+DISARM                  -> Motorları durdur
+THR=10.0               -> %10 throttle
+ROLL=5.0               -> 5 derece roll komutu
+PITCH=-3.0             -> -3 derece pitch komutu
+YAW=15.0               -> 15 deg/s yaw rate
+RATE_RP=0.25,0.30,0.003  -> Rate roll/pitch PID
+RATE_YAW=0.40,0.20,0.0   -> Rate yaw PID
+ATT_RP=2.5,0.1,0.0       -> Attitude roll/pitch PID
+TEL=1                    -> Telemetri aç
+TEL=0                    -> Telemetri kapat
+GET                      -> Mevcut gain'leri getir
+HB                       -> Heartbeat (auto-disarm için)
+
+Telemetri Formatı (TEL=1 ile):
+------------------------------
+$ATT,12.3,-5.1,45.2*     -> Roll, Pitch, Yaw (derece)
+$MOT,15.2,14.8,15.1,14.9* -> Motor 1-4 (%)
+$GYR,1.2,-0.8,5.3*       -> Gyro X,Y,Z (deg/s)
+
+Notlar:
+-------
+- ARM için throttle < %5 olmalı
+- HB komutu 2 saniyede bir gönderilmeli (yoksa auto-disarm)
+- Bağlantı kopunca otomatik disarm olur
+- TEL=1 göndermeden telemetri gelmez
+*/

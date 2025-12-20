@@ -182,6 +182,8 @@ int8_t i2cReadBytes(i2c_master_dev_handle_t dev_handle, uint8_t reg_addr,
 /* ============================================================================
  * Write Multiple Bytes to Register
  * ============================================================================ */
+#define I2C_MAX_WRITE_LEN   64  /* Maximum write buffer size */
+
 int8_t i2cWriteBytes(i2c_master_dev_handle_t dev_handle, uint8_t reg_addr,
                      uint8_t *data, uint16_t len)
 {
@@ -189,8 +191,14 @@ int8_t i2cWriteBytes(i2c_master_dev_handle_t dev_handle, uint8_t reg_addr,
         return -1;
     }
 
-    /* Create buffer with register address + data */
-    uint8_t write_buf[len + 1];
+    /* Check buffer size limit to prevent stack overflow */
+    if (len + 1 > I2C_MAX_WRITE_LEN) {
+        ESP_LOGE(TAG, "Write length %d exceeds max %d", len, I2C_MAX_WRITE_LEN - 1);
+        return -3;
+    }
+
+    /* Create buffer with register address + data (static size) */
+    uint8_t write_buf[I2C_MAX_WRITE_LEN];
     write_buf[0] = reg_addr;
     memcpy(&write_buf[1], data, len);
 

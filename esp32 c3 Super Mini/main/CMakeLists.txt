@@ -1,0 +1,13 @@
+idf_component_register(SRCS "helper.c" "ble_tuner.c" "quaternion_math.c"
+ "matrix_math.c" 
+ "ekf_quat.c" 
+ "rate_controller.c" 
+ "attitude_controller.c" 
+ "motor_mixer.c"
+ "pid_controller.c"
+ "i2c_driver.c"
+ "mpu9250.c"
+ "ton.c"
+ "edge_detection.c"
+ "main.c"
+                    INCLUDE_DIRS ".")
